@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { Plus, Trash2, LogOut, RotateCcw, Check, X, Circle } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { SpeedInsights } from "@vercel/speed-insights/react";
+import { Analytics } from "@vercel/analytics/react";
 
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const SKIP_REASONS = ["Too tired","No fixed time","Distracted","Forgot","Other plans"];
@@ -554,6 +555,7 @@ export default function App() {
   return (
     <div style={{ minHeight:"100vh", backgroundColor: t.bg, color: t.text, fontFamily:"sans-serif" }}>
       <SpeedInsights />
+      <Analytics />
 
       <div style={{ backgroundColor: t.card, borderBottom:`1px solid ${t.border}`, padding:"12px 24px" }}>
         <div style={{ maxWidth:1100, margin:"0 auto", display:"flex", flexWrap:"wrap", alignItems:"center", justifyContent:"space-between", gap:10 }}>
