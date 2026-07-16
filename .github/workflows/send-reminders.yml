@@ -1,0 +1,15 @@
+name: Send Reminders
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call reminder endpoint
+        run: |
+          curl -sf -X POST https://life-tracker-po668221.vercel.app/api/send-reminders \
+            -H "Authorization: Bearer ${{ secrets.REMINDER_CRON_SECRET }}"

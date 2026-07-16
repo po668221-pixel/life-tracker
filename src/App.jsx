@@ -3,9 +3,10 @@ import { Plus, Trash2, LogOut, RotateCcw, Check, X, Circle } from "lucide-react"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { SpeedInsights } from "@vercel/speed-insights/react";
 import { Analytics } from "@vercel/analytics/react";
-import { auth, db, googleProvider } from "./firebase";
+import { auth, db, googleProvider, messagingPromise, VAPID_KEY } from "./firebase";
 import { signInWithPopup, onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
+import { getToken, onMessage } from "firebase/messaging";
 
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const SKIP_REASONS = ["Too tired","No fixed time","Distracted","Forgot","Other plans"];
@@ -267,7 +268,13 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState(null); // { message, onConfirm } or null
   const [notifEnabled, setNotifEnabled] = useState(() => load("lt_notif_enabled", false));
   const [notifTime, setNotifTime] = useState(() => load("lt_notif_time", "20:00"));
+  const [notifIntervalHours, setNotifIntervalHours] = useState(() => load("lt_notif_interval_hours", 3));
   const [notifError, setNotifError] = useState("");
+  // True once a Google-signed-in user has a working FCM push token saved --
+  // at that point the server-side reminder job (api/send-reminders.js)
+  // covers them for both open and closed tabs, so the local timer above is
+  // suppressed to avoid double notifications.
+  const [pushActive, setPushActive] = useState(false);
 
   // Google sign-in is the path that gives cross-device continuity: signed-in
   // users' data lives in Firestore (keyed by their Firebase uid) instead of
@@ -301,6 +308,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem("lt_goals", JSON.stringify(goals)); }, [goals]);
   useEffect(() => { localStorage.setItem("lt_notif_enabled", JSON.stringify(notifEnabled)); }, [notifEnabled]);
   useEffect(() => { localStorage.setItem("lt_notif_time", JSON.stringify(notifTime)); }, [notifTime]);
+  useEffect(() => { localStorage.setItem("lt_notif_interval_hours", JSON.stringify(notifIntervalHours)); }, [notifIntervalHours]);
 
   // Fires once on mount, and again on sign-in/sign-out. Firebase reports the
   // restored session (or null) synchronously from local persistence, so this
@@ -344,8 +352,10 @@ export default function App() {
     if (!googleUser || !cloudSynced) return;
     setDoc(doc(db, "users", googleUser.uid), {
       habits, savings, expenses, goals, theme, anim, currency,
+      notifEnabled, notifTime, notifIntervalHours,
+      notifTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }, { merge: true }).catch(() => {});
-  }, [googleUser, cloudSynced, habits, savings, expenses, goals, theme, anim, currency]);
+  }, [googleUser, cloudSynced, habits, savings, expenses, goals, theme, anim, currency, notifEnabled, notifTime, notifIntervalHours]);
 
   const signInWithGoogle = async () => {
     setGoogleError("");
@@ -369,32 +379,50 @@ export default function App() {
     setUserName("");
   };
 
-  // Checks once a minute (while this tab is open) whether it's time to fire
-  // today's reminder. Browser notifications can't be scheduled to fire while
-  // the tab is closed without a service worker + push backend, which this
-  // app deliberately doesn't have — so this only works while the tab is open,
-  // same as everything else here running off localStorage.
+  // Checks every 30s (while this tab is open) whether an interval-sized
+  // "slot" since notifTime has elapsed without being fired yet. The day is
+  // divided into slots of notifIntervalHours starting at notifTime; this
+  // repeats a check-in every slot until everything's resolved for the day
+  // (all habits logged + water target hit), then goes quiet until tomorrow.
+  // Browser notifications can't be scheduled to fire while the tab is
+  // closed without a service worker + push backend — Google-signed-in users
+  // get that via Firebase Cloud Messaging instead (see the push-registration
+  // effect below), which suppresses this local timer for them so the two
+  // paths don't double-notify. PIN-only users rely on this alone.
   useEffect(() => {
-    if (!notifEnabled) return;
+    if (!notifEnabled || pushActive) return;
     const checkAndFire = () => {
       if (!("Notification" in window) || Notification.permission !== "granted") return;
       const now = new Date();
-      const nowHM = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
-      if (nowHM !== notifTime) return;
+      const [h, m] = notifTime.split(":").map(Number);
+      const anchor = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+      if (now < anchor) return;
+
+      const intervalMs = notifIntervalHours * 60 * 60 * 1000;
+      const slot = Math.floor((now - anchor) / intervalMs);
       const today = todayKey();
-      if (localStorage.getItem("lt_notif_last_fired") === today) return;
-      localStorage.setItem("lt_notif_last_fired", today);
+      const slotKey = `${today}#${slot}`;
+      const lastFired = localStorage.getItem("lt_notif_last_fired") || "";
+      if (lastFired === slotKey) return;
 
-      new Notification("Life Tracker", { body: "Time to check in on today's habits!" });
+      const pendingCount = habits.filter(hb => !hb.history?.[today]?.status).length;
+      const waterAmount = habits.find(hb => hb.name === "Water Intake")?.history?.[today]?.amount || 0;
+      const resolved = pendingCount === 0 && waterAmount >= WATER_TARGET_L;
+      if (resolved) return;
 
-      const pendingCount = habits.filter(h => !h.history?.[today]?.status).length;
+      const isFirstFireToday = !lastFired.startsWith(`${today}#`);
+      localStorage.setItem("lt_notif_last_fired", slotKey);
+
+      if (isFirstFireToday) {
+        new Notification("Life Tracker", { body: "Time to check in on today's habits!" });
+      }
+
       if (pendingCount > 0) {
         new Notification("Life Tracker", {
           body: `You still have ${pendingCount} habit${pendingCount === 1 ? "" : "s"} not logged today.`,
         });
       }
 
-      const waterAmount = habits.find(h => h.name === "Water Intake")?.history?.[today]?.amount || 0;
       if (waterAmount < WATER_TARGET_L) {
         new Notification("Life Tracker", {
           body: `Water intake is behind target: ${waterAmount}L of ${WATER_TARGET_L}L.`,
@@ -404,7 +432,7 @@ export default function App() {
     checkAndFire();
     const id = setInterval(checkAndFire, 30000);
     return () => clearInterval(id);
-  }, [notifEnabled, notifTime, habits]);
+  }, [notifEnabled, notifTime, notifIntervalHours, habits, pushActive]);
 
   // Requests browser notification permission the moment the user turns
   // reminders on, rather than waiting until the first scheduled fire — so
@@ -417,7 +445,39 @@ export default function App() {
     if (perm !== "granted") { setNotifError("Notification permission was denied."); return; }
     setNotifError("");
     setNotifEnabled(true);
+
+    // Push setup is Google-only: PIN-only users have no Firestore doc for a
+    // server-side job to read a token from. Failure here is a soft
+    // degrade -- they just keep the local tab-open timer instead.
+    if (!googleUser) return;
+    try {
+      const messaging = await messagingPromise;
+      if (!messaging || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+      const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+      const token = await getToken(messaging, { vapidKey: VAPID_KEY, serviceWorkerRegistration: registration });
+      await setDoc(doc(db, "users", googleUser.uid), { fcmToken: token }, { merge: true });
+      setPushActive(true);
+    } catch {
+      setNotifError("Couldn't set up background reminders — reminders will still work while this tab stays open.");
+    }
   };
+
+  // Foreground FCM messages don't auto-display like background ones do --
+  // this shows them the same way the local timer would have, so a Google
+  // user with the tab open still sees the reminder (just via the server
+  // path instead of the suppressed local one).
+  useEffect(() => {
+    if (!pushActive) return;
+    let unsub;
+    messagingPromise.then(messaging => {
+      if (!messaging) return;
+      unsub = onMessage(messaging, payload => {
+        const { title, body } = payload.notification || {};
+        new Notification(title || "Life Tracker", { body: body || "" });
+      });
+    });
+    return () => unsub && unsub();
+  }, [pushActive]);
 
   const themes = {
     dark:      { bg: "#111827", card: "#1f2937", border: "#374151", text: "#f9fafb", sub: "#9ca3af", input: "#374151" },
@@ -742,13 +802,33 @@ export default function App() {
               🔔 Reminders
             </label>
             {notifEnabled && (
-              <input type="time" value={notifTime} onChange={e => setNotifTime(e.target.value)}
-                style={{ ...inputStyle, width:"auto", padding:"6px 10px" }} />
+              <>
+                <input type="time" value={notifTime} onChange={e => setNotifTime(e.target.value)}
+                  style={{ ...inputStyle, width:"auto", padding:"6px 10px" }} />
+                <select value={notifIntervalHours} onChange={e => setNotifIntervalHours(Number(e.target.value))}
+                  style={{ ...inputStyle, width:"auto", padding:"6px 10px" }}>
+                  <option value={1}>Every 1h</option>
+                  <option value={2}>Every 2h</option>
+                  <option value={3}>Every 3h</option>
+                  <option value={4}>Every 4h</option>
+                  <option value={5}>Every 5h</option>
+                  <option value={6}>Every 6h</option>
+                </select>
+              </>
             )}
             <button onClick={lockApp} style={btnGray}><LogOut size={15}/> Lock</button>
             <button onClick={logout} style={btnRed}><LogOut size={15}/> Logout</button>
           </div>
         </div>
+        {notifEnabled && (
+          <div style={{ maxWidth:1100, margin:"6px auto 0", fontSize:11, color: t.sub }}>
+            {googleUser
+              ? (pushActive
+                  ? "Signed in with Google — reminders can arrive even when this tab or browser is closed."
+                  : "Signed in with Google, but background reminders aren't set up on this device yet — reminders only fire while this tab stays open.")
+              : "Reminders only fire while this tab stays open. Sign in with Google for reminders even when it's closed."}
+          </div>
+        )}
         {notifError && (
           <div style={{ maxWidth:1100, margin:"6px auto 0", fontSize:12, color:"#ef4444" }}>{notifError}</div>
         )}
