@@ -3,6 +3,9 @@ import { Plus, Trash2, LogOut, RotateCcw, Check, X, Circle } from "lucide-react"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { SpeedInsights } from "@vercel/speed-insights/react";
 import { Analytics } from "@vercel/analytics/react";
+import { auth, db, googleProvider } from "./firebase";
+import { signInWithPopup, onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
 
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const SKIP_REASONS = ["Too tired","No fixed time","Distracted","Forgot","Other plans"];
@@ -266,6 +269,17 @@ export default function App() {
   const [notifTime, setNotifTime] = useState(() => load("lt_notif_time", "20:00"));
   const [notifError, setNotifError] = useState("");
 
+  // Google sign-in is the path that gives cross-device continuity: signed-in
+  // users' data lives in Firestore (keyed by their Firebase uid) instead of
+  // just this browser's localStorage. Name+PIN users are unaffected — they
+  // stay entirely local, same as before this feature existed.
+  const [googleUser, setGoogleUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  // Guards against overwriting the cloud copy with local defaults during the
+  // brief window between sign-in and the Firestore fetch completing.
+  const [cloudSynced, setCloudSynced] = useState(false);
+  const [googleError, setGoogleError] = useState("");
+
   const sym = { NGN: "₦", SAR: "﷼", CNY: "¥" }[currency] || currency;
   const minEntryAmount = { NGN: 500, SAR: 10, CNY: 10 }[currency] || 500;
   // Only entries logged in the currently selected currency count toward
@@ -287,6 +301,73 @@ export default function App() {
   useEffect(() => { localStorage.setItem("lt_goals", JSON.stringify(goals)); }, [goals]);
   useEffect(() => { localStorage.setItem("lt_notif_enabled", JSON.stringify(notifEnabled)); }, [notifEnabled]);
   useEffect(() => { localStorage.setItem("lt_notif_time", JSON.stringify(notifTime)); }, [notifTime]);
+
+  // Fires once on mount, and again on sign-in/sign-out. Firebase reports the
+  // restored session (or null) synchronously from local persistence, so this
+  // resolves almost immediately even for returning Google users.
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      setGoogleUser(user);
+      if (user) {
+        setLoggedIn(true);
+        setUnlocked(true);
+        setUserName(user.displayName || user.email || "there");
+        try {
+          const snap = await getDoc(doc(db, "users", user.uid));
+          if (snap.exists()) {
+            const data = snap.data();
+            if (data.habits) setHabits(data.habits);
+            if (data.savings) setSavings(data.savings);
+            if (data.expenses) setExpenses(data.expenses);
+            if (data.goals) setGoals(data.goals);
+            if (data.theme) setTheme(data.theme);
+            if (data.anim) setAnim(data.anim);
+            if (data.currency) setCurrency(data.currency);
+          }
+        } catch {
+          setGoogleError("Couldn't load your synced data — check your connection.");
+        }
+        setCloudSynced(true);
+      } else {
+        setCloudSynced(false);
+      }
+      setAuthChecked(true);
+    });
+    return unsub;
+  }, []);
+
+  // Mirrors state to Firestore for Google-signed-in users only, so the same
+  // account picks up where it left off on another device. Waits for
+  // cloudSynced so the initial local defaults don't briefly clobber
+  // whatever was already saved in the cloud before the fetch above resolves.
+  useEffect(() => {
+    if (!googleUser || !cloudSynced) return;
+    setDoc(doc(db, "users", googleUser.uid), {
+      habits, savings, expenses, goals, theme, anim, currency,
+    }, { merge: true }).catch(() => {});
+  }, [googleUser, cloudSynced, habits, savings, expenses, goals, theme, anim, currency]);
+
+  const signInWithGoogle = async () => {
+    setGoogleError("");
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch {
+      setGoogleError("Google sign-in failed. Please try again.");
+    }
+  };
+
+  // Shared by both the Lock and Logout buttons for a Google session — unlike
+  // the PIN flow there's no local-only "quick hide," since the account's
+  // data already lives safely in Firestore either way. Signing back in with
+  // one click restores everything.
+  const signOutGoogle = () => {
+    firebaseSignOut(auth).catch(() => {});
+    setGoogleUser(null);
+    setCloudSynced(false);
+    setLoggedIn(false);
+    setUnlocked(false);
+    setUserName("");
+  };
 
   // Checks once a minute (while this tab is open) whether it's time to fire
   // today's reminder. Browser notifications can't be scheduled to fire while
@@ -384,6 +465,7 @@ export default function App() {
   // again from scratch. Separate from lockApp, which just hides the
   // dashboard without deleting anything.
   const logout = () => {
+    if (googleUser) { signOutGoogle(); return; }
     setLoggedIn(false);
     setUnlocked(false);
     setUserName("");
@@ -395,6 +477,7 @@ export default function App() {
   // touching any data — the thing to tap before handing your phone to
   // someone else, without losing your profile.
   const lockApp = () => {
+    if (googleUser) { signOutGoogle(); return; }
     setUnlocked(false);
     setPinInput("");
     setPinError("");
@@ -578,18 +661,33 @@ export default function App() {
   const totalSavLastMonth = sumInMonth(savingsInCurrency, lastMonthDate.getFullYear(), lastMonthDate.getMonth());
   const totalExpLastMonth = sumInMonth(expensesInCurrency, lastMonthDate.getFullYear(), lastMonthDate.getMonth());
 
+  if (!authChecked) return (
+    <div style={{ minHeight:"100vh", backgroundColor: t.bg, display:"flex", alignItems:"center", justifyContent:"center", color: t.sub }}>
+      Loading…
+    </div>
+  );
+
   if (!loggedIn) return (
     <div style={{ minHeight:"100vh", backgroundColor: t.bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
       <div style={{ ...cardStyle, width: 340, padding: 36 }}>
         <h1 style={{ color: t.text, fontSize: 28, fontWeight: 700, marginBottom: 8, textAlign:"center" }}>Life Tracker</h1>
-        <p style={{ color: t.sub, fontSize:13, marginBottom:20, textAlign:"center" }}>Set a PIN so this stays private on shared devices.</p>
+        <p style={{ color: t.sub, fontSize:13, marginBottom:20, textAlign:"center" }}>Sign in with Google to sync across devices, or set a local PIN for this device only.</p>
+        <button onClick={signInWithGoogle} style={{ ...btnPrimary, width:"100%", justifyContent:"center", padding:"10px 0", fontSize:15, backgroundColor:"#fff", color:"#111827", border:"1px solid #d1d5db", marginBottom:8 }}>
+          Sign in with Google
+        </button>
+        {googleError && <div style={{ fontSize:12, color:"#ef4444", marginBottom:10, textAlign:"center" }}>{googleError}</div>}
+        <div style={{ display:"flex", alignItems:"center", gap:10, margin:"18px 0", color: t.sub, fontSize:12 }}>
+          <div style={{ flex:1, height:1, backgroundColor: t.border }}></div>
+          or continue without Google
+          <div style={{ flex:1, height:1, backgroundColor: t.border }}></div>
+        </div>
         <input style={{ ...inputStyle, marginBottom: 12 }} placeholder="Enter your name" value={loginInput}
           onChange={e => setLoginInput(e.target.value)} onKeyPress={e => e.key === "Enter" && createProfile()} />
         <input type="password" inputMode="numeric" style={{ ...inputStyle, marginBottom: 6 }} placeholder="Create a PIN (min 4 digits)" value={pinSetupInput}
           onChange={e => { setPinSetupInput(e.target.value); if (pinError) setPinError(""); }} onKeyPress={e => e.key === "Enter" && createProfile()} />
         {pinError && <div style={{ fontSize:12, color:"#ef4444", marginBottom:10 }}>{pinError}</div>}
         <button onClick={createProfile} style={{ ...btnPrimary, width:"100%", justifyContent:"center", padding:"10px 0", fontSize:16, marginTop: pinError ? 0 : 8 }}>Enter</button>
-        <p style={{ fontSize:11, color: t.sub, marginTop:14, textAlign:"center" }}>This PIN is stored locally on this device only — it's a privacy lock, not a secure login.</p>
+        <p style={{ fontSize:11, color: t.sub, marginTop:14, textAlign:"center" }}>The local PIN option is stored on this device only — it's a privacy lock, not a synced account.</p>
       </div>
     </div>
   );
@@ -615,7 +713,10 @@ export default function App() {
 
       <div style={{ backgroundColor: t.card, borderBottom:`1px solid ${t.border}`, padding:"12px 24px" }}>
         <div style={{ maxWidth:1100, margin:"0 auto", display:"flex", flexWrap:"wrap", alignItems:"center", justifyContent:"space-between", gap:10 }}>
-          <span style={{ fontWeight:700, fontSize:18 }}>Welcome, {userName}!</span>
+          <span style={{ fontWeight:700, fontSize:18 }}>
+            Welcome, {userName}!
+            {googleUser && <span style={{ fontWeight:400, fontSize:12, color: t.sub, marginLeft:8 }}>🔄 Synced with Google</span>}
+          </span>
           <div style={{ display:"flex", flexWrap:"wrap", gap:8, alignItems:"center" }}>
             <select value={theme} onChange={e => setTheme(e.target.value)} style={{ ...inputStyle, width:"auto", padding:"6px 10px" }}>
               <option value="dark">🌙 Dark</option>
