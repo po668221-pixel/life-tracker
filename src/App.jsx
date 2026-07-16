@@ -6,6 +6,14 @@ import { Analytics } from "@vercel/analytics/react";
 
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const SKIP_REASONS = ["Too tired","No fixed time","Distracted","Forgot","Other plans"];
+// Water Intake is tracked as an actual quantity (liters) rather than a
+// plain done/skip tap, since "did you drink water" isn't meaningful
+// without how much. Status auto-flips to "done" once the daily target
+// is reached, so streaks and the consistency calendar keep working the
+// same way they do for every other habit. Kept at module scope so the
+// notification check (below) can reference the same target as the UI.
+const WATER_TARGET_L = 2;
+const WATER_STEP_L = 0.25;
 
 const defaultHabits = [
   { id: 1, name: "Exercise", completed: false, history: {} },
@@ -254,6 +262,9 @@ export default function App() {
   const [expError, setExpError] = useState("");
   const [reasonPickerFor, setReasonPickerFor] = useState(null); // habit id currently choosing a skip reason
   const [confirmDialog, setConfirmDialog] = useState(null); // { message, onConfirm } or null
+  const [notifEnabled, setNotifEnabled] = useState(() => load("lt_notif_enabled", false));
+  const [notifTime, setNotifTime] = useState(() => load("lt_notif_time", "20:00"));
+  const [notifError, setNotifError] = useState("");
 
   const sym = { NGN: "₦", SAR: "﷼", CNY: "¥" }[currency] || currency;
   const minEntryAmount = { NGN: 500, SAR: 10, CNY: 10 }[currency] || 500;
@@ -274,6 +285,58 @@ export default function App() {
   useEffect(() => { localStorage.setItem("lt_savings", JSON.stringify(savings)); }, [savings]);
   useEffect(() => { localStorage.setItem("lt_expenses", JSON.stringify(expenses)); }, [expenses]);
   useEffect(() => { localStorage.setItem("lt_goals", JSON.stringify(goals)); }, [goals]);
+  useEffect(() => { localStorage.setItem("lt_notif_enabled", JSON.stringify(notifEnabled)); }, [notifEnabled]);
+  useEffect(() => { localStorage.setItem("lt_notif_time", JSON.stringify(notifTime)); }, [notifTime]);
+
+  // Checks once a minute (while this tab is open) whether it's time to fire
+  // today's reminder. Browser notifications can't be scheduled to fire while
+  // the tab is closed without a service worker + push backend, which this
+  // app deliberately doesn't have — so this only works while the tab is open,
+  // same as everything else here running off localStorage.
+  useEffect(() => {
+    if (!notifEnabled) return;
+    const checkAndFire = () => {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const now = new Date();
+      const nowHM = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+      if (nowHM !== notifTime) return;
+      const today = todayKey();
+      if (localStorage.getItem("lt_notif_last_fired") === today) return;
+      localStorage.setItem("lt_notif_last_fired", today);
+
+      new Notification("Life Tracker", { body: "Time to check in on today's habits!" });
+
+      const pendingCount = habits.filter(h => !h.history?.[today]?.status).length;
+      if (pendingCount > 0) {
+        new Notification("Life Tracker", {
+          body: `You still have ${pendingCount} habit${pendingCount === 1 ? "" : "s"} not logged today.`,
+        });
+      }
+
+      const waterAmount = habits.find(h => h.name === "Water Intake")?.history?.[today]?.amount || 0;
+      if (waterAmount < WATER_TARGET_L) {
+        new Notification("Life Tracker", {
+          body: `Water intake is behind target: ${waterAmount}L of ${WATER_TARGET_L}L.`,
+        });
+      }
+    };
+    checkAndFire();
+    const id = setInterval(checkAndFire, 30000);
+    return () => clearInterval(id);
+  }, [notifEnabled, notifTime, habits]);
+
+  // Requests browser notification permission the moment the user turns
+  // reminders on, rather than waiting until the first scheduled fire — so
+  // they get immediate feedback if they deny/block it instead of silently
+  // never seeing a notification later.
+  const toggleNotifications = async (checked) => {
+    if (!checked) { setNotifEnabled(false); setNotifError(""); return; }
+    if (!("Notification" in window)) { setNotifError("Notifications aren't supported in this browser."); return; }
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") { setNotifError("Notification permission was denied."); return; }
+    setNotifError("");
+    setNotifEnabled(true);
+  };
 
   const themes = {
     dark:      { bg: "#111827", card: "#1f2937", border: "#374151", text: "#f9fafb", sub: "#9ca3af", input: "#374151" },
@@ -401,13 +464,6 @@ export default function App() {
     });
   };
 
-  // Water Intake is tracked as an actual quantity (liters) rather than a
-  // plain done/skip tap, since "did you drink water" isn't meaningful
-  // without how much. Status auto-flips to "done" once the daily target
-  // is reached, so streaks and the consistency calendar keep working the
-  // same way they do for every other habit.
-  const WATER_TARGET_L = 2;
-  const WATER_STEP_L = 0.25;
   const addWaterAmount = (id, delta) => {
     const today = todayKey();
     setHabits(prev => prev.map(h => {
@@ -576,10 +632,21 @@ export default function App() {
               <option value="SAR">﷼ Riyals</option>
               <option value="CNY">¥ Yuan</option>
             </select>
+            <label style={{ display:"flex", alignItems:"center", gap:6, fontSize:13, color: t.sub, cursor:"pointer" }}>
+              <input type="checkbox" checked={notifEnabled} onChange={e => toggleNotifications(e.target.checked)} />
+              🔔 Reminders
+            </label>
+            {notifEnabled && (
+              <input type="time" value={notifTime} onChange={e => setNotifTime(e.target.value)}
+                style={{ ...inputStyle, width:"auto", padding:"6px 10px" }} />
+            )}
             <button onClick={lockApp} style={btnGray}><LogOut size={15}/> Lock</button>
             <button onClick={logout} style={btnRed}><LogOut size={15}/> Logout</button>
           </div>
         </div>
+        {notifError && (
+          <div style={{ maxWidth:1100, margin:"6px auto 0", fontSize:12, color:"#ef4444" }}>{notifError}</div>
+        )}
       </div>
 
       <div style={{ backgroundColor: t.card, borderBottom:`1px solid ${t.border}`, position:"sticky", top:0, zIndex:10 }}>
