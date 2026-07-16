@@ -494,7 +494,11 @@ export default function App() {
       const cur = h.history?.[today]?.status || null;
       const next = cur === null ? "done" : "skip";
       const newHistory = { ...(h.history || {}) };
-      newHistory[today] = { status: next, reason: next === "skip" ? newHistory[today]?.reason : undefined };
+      // null, not undefined: Firestore's client SDK throws on literal
+      // undefined field values (localStorage silently drops them via
+      // JSON.stringify, which is how this went unnoticed until Firestore
+      // sync was added).
+      newHistory[today] = { status: next, reason: next === "skip" ? (newHistory[today]?.reason ?? null) : null };
       if (next === "skip") setReasonPickerFor(id);
       return { ...h, completed: next === "done", history: newHistory };
     }));
@@ -556,7 +560,7 @@ export default function App() {
       const wasSkip = h.history?.[today]?.status === "skip";
       const status = next >= WATER_TARGET_L ? "done" : (wasSkip ? "skip" : null);
       const newHistory = { ...(h.history || {}) };
-      newHistory[today] = { amount: next, status, reason: status === "skip" ? newHistory[today]?.reason : undefined };
+      newHistory[today] = { amount: next, status, reason: status === "skip" ? (newHistory[today]?.reason ?? null) : null };
       return { ...h, completed: status === "done", history: newHistory };
     }));
   };
