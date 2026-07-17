@@ -457,7 +457,8 @@ export default function App() {
       const token = await getToken(messaging, { vapidKey: VAPID_KEY, serviceWorkerRegistration: registration });
       await setDoc(doc(db, "users", googleUser.uid), { fcmToken: token }, { merge: true });
       setPushActive(true);
-    } catch {
+    } catch (err) {
+      console.error("Push notification setup failed:", err);
       setNotifError("Couldn't set up background reminders — reminders will still work while this tab stays open.");
     }
   };
