@@ -3,7 +3,7 @@ import { Plus, Trash2, LogOut, RotateCcw, Check, X, Circle } from "lucide-react"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { SpeedInsights } from "@vercel/speed-insights/react";
 import { Analytics } from "@vercel/analytics/react";
-import { auth, db, googleProvider, messagingPromise, VAPID_KEY } from "./firebase";
+import { auth, db, googleProvider, getMessagingIfSupported, VAPID_KEY } from "./firebase";
 import { signInWithPopup, onAuthStateChanged, signOut as firebaseSignOut } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { getToken, onMessage } from "firebase/messaging";
@@ -451,15 +451,18 @@ export default function App() {
     // degrade -- they just keep the local tab-open timer instead.
     if (!googleUser) return;
     try {
-      const messaging = await messagingPromise;
-      if (!messaging || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+      const messaging = await getMessagingIfSupported();
+      if (!messaging) { setNotifError("Background reminders aren't supported in this browser (no messaging support) — reminders will still work while this tab stays open."); return; }
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) { setNotifError("Background reminders aren't supported in this browser (no service worker/push support) — reminders will still work while this tab stays open."); return; }
       const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+      await navigator.serviceWorker.ready; // wait for the worker to become active, not just registered
       const token = await getToken(messaging, { vapidKey: VAPID_KEY, serviceWorkerRegistration: registration });
       await setDoc(doc(db, "users", googleUser.uid), { fcmToken: token }, { merge: true });
       setPushActive(true);
     } catch (err) {
       console.error("Push notification setup failed:", err);
-      setNotifError("Couldn't set up background reminders — reminders will still work while this tab stays open.");
+      const detail = err?.code || err?.message || String(err);
+      setNotifError(`Couldn't set up background reminders (${detail}) — reminders will still work while this tab stays open.`);
     }
   };
 
@@ -470,7 +473,7 @@ export default function App() {
   useEffect(() => {
     if (!pushActive) return;
     let unsub;
-    messagingPromise.then(messaging => {
+    getMessagingIfSupported().then(messaging => {
       if (!messaging) return;
       unsub = onMessage(messaging, payload => {
         const { title, body } = payload.notification || {};

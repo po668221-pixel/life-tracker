@@ -24,7 +24,12 @@ export const googleProvider = new GoogleAuthProvider();
 // trust level as firebaseConfig above -- not a secret.
 export const VAPID_KEY = "BNjrrRZPqC8mzG_bXDdPwnjSY3KmqgbF3uO1tISeM8SRP8frmVFvNmwiNCx6CUECDPCj_0haJMHeJYQtv27_-Wk";
 
-// getMessaging() throws in browsers/webviews without push support, so this
-// resolves to null there instead of crashing app startup; callers must
-// check for null before using it.
-export const messagingPromise = isSupported().then(supported => (supported ? getMessaging(app) : null));
+// Deliberately lazy, NOT computed once at module load: isSupported()'s
+// IndexedDB-openable check can race with the page still settling right
+// after script evaluation, silently resolving false. Calling it fresh at
+// the moment the user actually enables push (a real user gesture, well
+// after load) avoids that whole class of timing bug. Returns null in
+// browsers/webviews without push support -- callers must check for null.
+export async function getMessagingIfSupported() {
+  return (await isSupported()) ? getMessaging(app) : null;
+}
